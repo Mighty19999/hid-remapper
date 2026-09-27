@@ -1610,12 +1610,112 @@ inline void monitor_read_input_range(const uint8_t* report, int len, uint32_t so
         }
     }
 }
+// =========================================================================
+// HARDWARE AIM TRICKS (10, 13, 21, 24, 26)
+// =========================================================================
+void apply_hardware_aim_tricks_to_raw(uint8_t* mutable_report, uint32_t current_time_ms) {
+    static float last_x = 0.0f;
+    static float last_y = 0.0f;
+    static uint32_t ads_start_time = 0;
+    static bool last_ads_state = false;
+    static float current_ads_sens = 1.0f;
+
+    // Bytes 1 und 2 für relative X/Y-Mausdaten auslesen
+    int8_t mouse_x_val = (int8_t)mutable_report[1];
+    int8_t mouse_y_val = (int8_t)mutable_report[2];
+    uint8_t buttons = mutable_report[0];
+
+    float raw_x = (float)mouse_x_val;
+    float raw_y = (float)mouse_y_val * 1.7778f; // TRICK 10: 16:9 Aspect Ratio Sync
+
+    // TRICK 21: ADS-Sensitivitäts-Zoom (Rechte Maustaste gehalten = Bit 1 aktiv)
+    bool ads_active = (buttons & 0x02); 
+    if (ads_active && !last_ads_state) {
+        ads_start_time = current_time_ms;
+    } else if (!ads_active) {
+        current_ads_sens = 1.0f;
+    }
+
+    if (ads_active) {
+        uint32_t elapsed = current_time_ms - ads_start_time;
+        if (elapsed >= 150) { 
+            current_ads_sens = 0.60f; // 60% Geschwindigkeit im Visier
+        } else {
+            float progress = (float)elapsed / 150.0f;
+            current_ads_sens = 1.0f - (progress * (1.0f - 0.60f));
+        }
+    }
+    last_ads_state = ads_active;
+    raw_x *= current_ads_sens;
+    raw_y *= current_ads_sens;
+
+    // TRICK 13: Flick-Smoothing (Zittern abfangen bei feinen Korrekturen)
+    float speed = sqrtf(raw_x * raw_x + raw_y * raw_y);
+    if (speed < 80.0f && speed > 1.0f) {
+        raw_x = (raw_x * 0.35f) + (last_x * (1.0f - 0.35f));
+        raw_y = (raw_y * 0.35f) + (last_y * (1.0f - 0.35f));
+    }
+    last_x = raw_x;
+    last_y = raw_y;
+
+    // TRICK 26: Kreiskorrektur
+    if (speed > 5.0f) {
+        float angle = atan2f(raw_y, raw_x);
+        float target_x = speed * cosf(angle);
+        float target_y = speed * sinf(angle);
+        raw_x = (raw_x * 0.85f) + (target_x * 0.15f);
+        raw_y = (raw_y * 0.85f) + (target_y * 0.15f);
+    }
+
+    // Werte zurück in das Paket schreiben
+    mutable_report[1] = (uint8_t)((int8_t)(raw_x > 127.0f ? 127.0f : (raw_x < -127.0f ? -127.0f : roundf(raw_x))));
+    mutable_report[2] = (uint8_t)((int8_t)(raw_y > 127.0f ? 127.0f : (raw_y < -127.0f ? -127.0f : roundf(raw_y))));
+}
 
 void handle_received_report(const uint8_t* report, int len, uint16_t interface, uint8_t external_report_id) {
-    if (our_descriptor->handle_received_report != nullptr) {
-        our_descriptor->handle_received_report(report, len, interface, external_report_id);
+    // Wir erstellen eine veränderbare Kopie des schreibgeschützten Reports
+    uint8_t* mutable_report = new uint8_t[len];
+    for (int i = 0; i < len; i++) {
+        mutable_report[i] = report[i];
     }
+
+    // TRICKS DIREKT IM ROHEN PACKET ANWENDEN
+    if (len >= 3) {
+        // Casten der X/Y-Werte und Buttons aus dem Datenstrom
+        int8_t mouse_x_val = (int8_t)mutable_report[1];
+        int8_t mouse_y_val = (int8_t)mutable_report[2];
+        uint8_t buttons = mutable_report[0];
+
+        // TRICK 10: 16:9 Aspect Ratio Sync (Vertikaler Ausgleich)
+        float raw_x = (float)mouse_x_val;
+        float raw_y = (float)mouse_y_val * 1.7778f; 
+
+        // TRICK 21: ADS-Dämpfung (Rechte Maustaste gehalten -> 60% Sensitivität)
+        if (buttons & 0x02) {
+            raw_x *= 0.60f;
+            raw_y *= 0.60f;
+        }
+
+        // TRICK 13 & 26: Integrierter Hardware-Glättungsfilter gegen Zittern
+        float speed = sqrtf(raw_x * raw_x + raw_y * raw_y);
+        if (speed < 80.0f && speed > 1.0f) {
+            raw_x *= 0.75f; // Dämpft feines Zittern bei Präzisionsbewegungen
+            raw_y *= 0.75f;
+        }
+
+        // Werte zurückschreiben und Grenzen einhalten
+        mutable_report[1] = (uint8_t)((int8_t)(raw_x > 127.0f ? 127.0f : (raw_x < -127.0f ? -127.0f : raw_x)));
+        mutable_report[2] = (uint8_t)((int8_t)(raw_y > 127.0f ? 127.0f : (raw_y < -127.0f ? -127.0f : raw_y)));
+    }
+
+    // Weitergabe an das System
+    if (our_descriptor->handle_received_report != nullptr) {
+        our_descriptor->handle_received_report(mutable_report, len, interface, external_report_id);
+    }
+
+    delete[] mutable_report;
 }
+
 
 static inline bool is_rollover(const uint8_t* report, int len, uint16_t interface, uint8_t report_id) {
     for (auto const& usage_def : rollover_usages[interface][report_id]) {
